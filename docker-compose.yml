@@ -1,0 +1,97 @@
+# Cross-venue prediction market mispricing detector.
+# Everything runs locally; no cloud services, no API keys.
+#
+# Services (added in build-order steps):
+#   Step 1: kafka, kafka-init, postgres, config-loader
+#
+# Bring up:  docker compose up -d --build
+
+services:
+  # --------------------------------------------------------------------------
+  # Kafka — single node, KRaft mode (combined broker + controller), no Zookeeper.
+  # Internal listener kafka:9092 for other containers; localhost:9094 exposed
+  # for debugging from the host (kcat, kafka-console-consumer, etc.).
+  # --------------------------------------------------------------------------
+  kafka:
+    image: apache/kafka:3.9.1
+    container_name: kafka
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # Single-node: every internal topic must have replication factor 1.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      # Topics are created explicitly by kafka-init; keep the broker strict.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    ports:
+      - "9094:9094"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  # One-shot: create the market-prices topic, then exit.
+  kafka-init:
+    image: apache/kafka:3.9.1
+    container_name: kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      "/opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092
+      --create --if-not-exists --topic market-prices
+      --partitions 3 --replication-factor 1
+      && echo 'topic market-prices ready'"
+    restart: "no"
+
+  # --------------------------------------------------------------------------
+  # Postgres — pipeline tables in the 'markets' DB (created by init scripts on
+  # first startup); a separate 'airflow' DB holds Airflow metadata (step 5).
+  # --------------------------------------------------------------------------
+  postgres:
+    image: postgres:16
+    container_name: postgres
+    environment:
+      POSTGRES_USER: markets
+      POSTGRES_PASSWORD: markets
+      POSTGRES_DB: markets
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U markets -d markets"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  # One-shot: sync config/matched_events.yaml into the matched_events table.
+  config-loader:
+    build: ./config_loader
+    container_name: config-loader
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_DSN: postgresql://markets:markets@postgres:5432/markets
+      MATCHED_EVENTS_PATH: /config/matched_events.yaml
+    volumes:
+      - ./config:/config:ro
+    restart: "no"
+
+volumes:
+  kafka_data:
+  postgres_data:

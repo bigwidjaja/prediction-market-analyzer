@@ -1,0 +1,49 @@
+# Manually curated list of event pairs that exist on BOTH Kalshi and Polymarket.
+#
+# Event matching across venues is intentionally manual in v1 (auto-matching is
+# out of scope). Each entry maps one Kalshi market ticker to one Polymarket
+# market slug that resolves on (approximately) the same real-world outcome.
+#
+# IMPORTANT: prediction markets close. These five pairs were verified live on
+# both venues on 2026-07-07. If the producer logs "market closed" for a pair,
+# replace it here and restart the producer + config-loader.
+#
+# Fields:
+#   event_id:        stable internal id used as the join key across the pipeline
+#   kalshi_ticker:   Kalshi market ticker (GET /trade-api/v2/markets/{ticker})
+#   polymarket_slug: Polymarket Gamma market slug (GET /markets?slug={slug})
+#   description:     human-readable description of the matched outcome
+
+matched_events:
+  - event_id: fed-jul2026-no-change
+    kalshi_ticker: KXFEDDECISION-26JUL-H0
+    polymarket_slug: will-there-be-no-change-in-fed-interest-rates-after-the-july-2026-meeting
+    description: >
+      Fed leaves rates unchanged at the July 2026 FOMC meeting.
+
+  - event_id: fed-jul2026-cut-25bps
+    kalshi_ticker: KXFEDDECISION-26JUL-C25
+    polymarket_slug: will-the-fed-decrease-interest-rates-by-25-bps-after-the-july-2026-meeting
+    description: >
+      Fed cuts rates by exactly 25bps at the July 2026 FOMC meeting.
+
+  - event_id: fed-sep2026-no-change
+    kalshi_ticker: KXFEDDECISION-26SEP-H0
+    polymarket_slug: will-there-be-no-change-in-fed-interest-rates-after-the-september-2026-meeting-615
+    description: >
+      Fed leaves rates unchanged at the September 2026 FOMC meeting.
+
+  - event_id: us-recession-2026
+    kalshi_ticker: KXRECSSNBER-26
+    polymarket_slug: us-recession-by-end-of-2026
+    description: >
+      US recession in 2026. CAVEAT: Kalshi resolves strictly on an NBER
+      declaration; Polymarket's resolution rules are similar but not identical,
+      so a persistent delta here may reflect a definition gap rather than a
+      tradeable mispricing.
+
+  - event_id: fed-hike-by-end-2026
+    kalshi_ticker: FEDHIKE-26DEC31
+    polymarket_slug: fed-rate-hike-in-2026
+    description: >
+      Federal Reserve hikes rates at least once by December 31, 2026.
