@@ -129,6 +129,7 @@ export function MarketDetailPage() {
                   stroke={palette.accent}
                   strokeWidth={2}
                   fill="url(#yesFill)"
+                  isAnimationActive={false}
                 />
               </AreaChart>
             </ResponsiveContainer>
