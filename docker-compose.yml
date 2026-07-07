@@ -1,0 +1,222 @@
+# Cross-venue prediction market mispricing detector.
+# Everything runs locally; no cloud services, no API keys.
+#
+# Services (added in build-order steps):
+#   Step 1: kafka, kafka-init, postgres, config-loader
+#   Step 2: producer
+#   Step 3/4: spark
+#   Step 5: airflow-init, airflow-webserver, airflow-scheduler
+#
+# Bring up:  docker compose up -d --build
+
+# Shared Airflow settings (LocalExecutor; metadata in the 'airflow' DB inside
+# the same Postgres container; pipeline DB exposed as connection 'markets_db').
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.11.0
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL: "30"
+    # Connection used by dags/pipeline_health_dag.py to query pipeline tables.
+    AIRFLOW_CONN_MARKETS_DB: postgres://markets:markets@postgres:5432/markets
+  volumes:
+    - ./dags:/opt/airflow/dags:ro
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+services:
+  # --------------------------------------------------------------------------
+  # Kafka — single node, KRaft mode (combined broker + controller), no Zookeeper.
+  # Internal listener kafka:9092 for other containers; localhost:9094 exposed
+  # for debugging from the host (kcat, kafka-console-consumer, etc.).
+  # --------------------------------------------------------------------------
+  kafka:
+    image: apache/kafka:3.9.1
+    container_name: kafka
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # Single-node: every internal topic must have replication factor 1.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      # Topics are created explicitly by kafka-init; keep the broker strict.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    ports:
+      - "9094:9094"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  # One-shot: create the market-prices topic, then exit.
+  kafka-init:
+    image: apache/kafka:3.9.1
+    container_name: kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      "/opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092
+      --create --if-not-exists --topic market-prices
+      --partitions 3 --replication-factor 1
+      && echo 'topic market-prices ready'"
+    restart: "no"
+
+  # --------------------------------------------------------------------------
+  # Postgres — pipeline tables in the 'markets' DB (created by init scripts on
+  # first startup); a separate 'airflow' DB holds Airflow metadata (step 5).
+  # --------------------------------------------------------------------------
+  postgres:
+    image: postgres:16
+    container_name: postgres
+    environment:
+      POSTGRES_USER: markets
+      POSTGRES_PASSWORD: markets
+      POSTGRES_DB: markets
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U markets -d markets"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  # One-shot: sync config/matched_events.yaml into the matched_events table.
+  config-loader:
+    build: ./config_loader
+    container_name: config-loader
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_DSN: postgresql://markets:markets@postgres:5432/markets
+      MATCHED_EVENTS_PATH: /config/matched_events.yaml
+    volumes:
+      - ./config:/config:ro
+    restart: "no"
+
+  # --------------------------------------------------------------------------
+  # Producer — polls Kalshi + Polymarket for each matched pair and publishes
+  # one JSON reading per (venue, event) to the market-prices topic.
+  # --------------------------------------------------------------------------
+  producer:
+    build: ./producer
+    container_name: producer
+    depends_on:
+      kafka:
+        condition: service_healthy
+      # Topic auto-create is disabled on the broker, so wait for kafka-init.
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: market-prices
+      POLL_INTERVAL_SECONDS: 45
+      MATCHED_EVENTS_PATH: /config/matched_events.yaml
+      # Current public no-auth Kalshi host (the older trading-api.kalshi.com
+      # returns 401 anonymously). Override here if Kalshi moves it again.
+      KALSHI_API_BASE: https://api.elections.kalshi.com/trade-api/v2
+      POLYMARKET_API_BASE: https://gamma-api.polymarket.com
+    volumes:
+      - ./config:/config:ro
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
+  # Spark — single container running spark-submit --master local[2] (no
+  # separate master/worker; a one-node "cluster" only adds RAM for zero value
+  # on a laptop). Connector jars are baked into the image at build time.
+  # --------------------------------------------------------------------------
+  spark:
+    build: ./spark_jobs
+    container_name: spark
+    depends_on:
+      kafka:
+        condition: service_healthy
+      # Topic auto-create is disabled on the broker, so wait for kafka-init.
+      kafka-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: market-prices
+      POSTGRES_URL: jdbc:postgresql://postgres:5432/markets
+      POSTGRES_USER: markets
+      POSTGRES_PASSWORD: markets
+      CHECKPOINT_ROOT: /opt/checkpoints
+      # Mispricing threshold in probability units (0.05 = 5 percentage
+      # points). Rough proxy for "edge after estimated fees" — see job code.
+      MISPRICING_THRESHOLD: "0.05"
+    volumes:
+      - spark_checkpoints:/opt/checkpoints
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
+  # Airflow — LocalExecutor. airflow-init migrates the metadata DB and creates
+  # the admin/admin user, then exits; webserver (UI on :8080) and scheduler
+  # run the pipeline_health DAG every 15 minutes.
+  # --------------------------------------------------------------------------
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - >
+        airflow db migrate &&
+        airflow users create --username admin --password admin
+        --firstname Admin --lastname User --role Admin --email admin@example.com
+        || true
+    restart: "no"
+
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow-webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  kafka_data:
+  postgres_data:
+  spark_checkpoints:
