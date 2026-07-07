@@ -1,0 +1,16 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    @apply bg-bg text-text font-sans text-sm antialiased;
+  }
+}
+
+@layer utilities {
+  /* All numeric data per DESIGN.md §2 */
+  .num {
+    @apply font-mono tabular-nums;
+  }
+}
