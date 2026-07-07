@@ -5,8 +5,26 @@
 #   Step 1: kafka, kafka-init, postgres, config-loader
 #   Step 2: producer
 #   Step 3/4: spark
+#   Step 5: airflow-init, airflow-webserver, airflow-scheduler
 #
 # Bring up:  docker compose up -d --build
+
+# Shared Airflow settings (LocalExecutor; metadata in the 'airflow' DB inside
+# the same Postgres container; pipeline DB exposed as connection 'markets_db').
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.11.0
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL: "30"
+    # Connection used by dags/pipeline_health_dag.py to query pipeline tables.
+    AIRFLOW_CONN_MARKETS_DB: postgres://markets:markets@postgres:5432/markets
+  volumes:
+    - ./dags:/opt/airflow/dags:ro
+  depends_on:
+    postgres:
+      condition: service_healthy
 
 services:
   # --------------------------------------------------------------------------
@@ -104,6 +122,9 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+      # Topic auto-create is disabled on the broker, so wait for kafka-init.
+      kafka-init:
+        condition: service_completed_successfully
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       KAFKA_TOPIC: market-prices
@@ -128,6 +149,9 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+      # Topic auto-create is disabled on the broker, so wait for kafka-init.
+      kafka-init:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
     environment:
@@ -142,6 +166,54 @@ services:
       MISPRICING_THRESHOLD: "0.05"
     volumes:
       - spark_checkpoints:/opt/checkpoints
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
+  # Airflow — LocalExecutor. airflow-init migrates the metadata DB and creates
+  # the admin/admin user, then exits; webserver (UI on :8080) and scheduler
+  # run the pipeline_health DAG every 15 minutes.
+  # --------------------------------------------------------------------------
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - >
+        airflow db migrate &&
+        airflow users create --username admin --password admin
+        --firstname Admin --lastname User --role Admin --email admin@example.com
+        || true
+    restart: "no"
+
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow-webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
     restart: unless-stopped
 
 volumes:
