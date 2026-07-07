@@ -3,6 +3,7 @@
 #
 # Services (added in build-order steps):
 #   Step 1: kafka, kafka-init, postgres, config-loader
+#   Step 2: producer
 #
 # Bring up:  docker compose up -d --build
 
@@ -91,6 +92,29 @@ services:
     volumes:
       - ./config:/config:ro
     restart: "no"
+
+  # --------------------------------------------------------------------------
+  # Producer — polls Kalshi + Polymarket for each matched pair and publishes
+  # one JSON reading per (venue, event) to the market-prices topic.
+  # --------------------------------------------------------------------------
+  producer:
+    build: ./producer
+    container_name: producer
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: market-prices
+      POLL_INTERVAL_SECONDS: 45
+      MATCHED_EVENTS_PATH: /config/matched_events.yaml
+      # Current public no-auth Kalshi host (the older trading-api.kalshi.com
+      # returns 401 anonymously). Override here if Kalshi moves it again.
+      KALSHI_API_BASE: https://api.elections.kalshi.com/trade-api/v2
+      POLYMARKET_API_BASE: https://gamma-api.polymarket.com
+    volumes:
+      - ./config:/config:ro
+    restart: unless-stopped
 
 volumes:
   kafka_data:
