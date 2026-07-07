@@ -4,6 +4,7 @@
 # Services (added in build-order steps):
 #   Step 1: kafka, kafka-init, postgres, config-loader
 #   Step 2: producer
+#   Step 3/4: spark
 #
 # Bring up:  docker compose up -d --build
 
@@ -116,6 +117,34 @@ services:
       - ./config:/config:ro
     restart: unless-stopped
 
+  # --------------------------------------------------------------------------
+  # Spark — single container running spark-submit --master local[2] (no
+  # separate master/worker; a one-node "cluster" only adds RAM for zero value
+  # on a laptop). Connector jars are baked into the image at build time.
+  # --------------------------------------------------------------------------
+  spark:
+    build: ./spark_jobs
+    container_name: spark
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: market-prices
+      POSTGRES_URL: jdbc:postgresql://postgres:5432/markets
+      POSTGRES_USER: markets
+      POSTGRES_PASSWORD: markets
+      CHECKPOINT_ROOT: /opt/checkpoints
+      # Mispricing threshold in probability units (0.05 = 5 percentage
+      # points). Rough proxy for "edge after estimated fees" — see job code.
+      MISPRICING_THRESHOLD: "0.05"
+    volumes:
+      - spark_checkpoints:/opt/checkpoints
+    restart: unless-stopped
+
 volumes:
   kafka_data:
   postgres_data:
+  spark_checkpoints:
