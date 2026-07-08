@@ -3,7 +3,7 @@
 Two independent streaming queries over the same Kafka source:
 
 1. Pass-through (step 3): every reading from the 'market-prices' topic is
-   appended to the Postgres table market_prices via foreachBatch + JDBC.
+   appended to the Postgres table market_prices via foreachBatch.
 
 2. Mispricing detector (step 4): the topic is split into a Kalshi stream and
    a Polymarket stream, which are stream-stream joined per matched_event_id
@@ -21,13 +21,25 @@ Join semantics — why an interval join and not "latest vs latest":
   tolerate the two venues' readings arriving at slightly different times.
 
 Each query has its own checkpoint directory, so they recover independently.
-Writes are at-least-once (plain JDBC append inside foreachBatch): a batch
-replayed after a crash between the JDBC commit and the checkpoint commit is
-inserted twice. Acceptable for v1; documented in the README.
+
+Delivery semantics — effectively-once:
+  Sinks INSERT via psycopg2 with ON CONFLICT DO NOTHING against the natural
+  keys (market_prices: venue+event+timestamp; mispricing_signals:
+  event+kalshi_ts). A micro-batch replayed after a crash between the DB
+  commit and the checkpoint commit therefore inserts nothing new, and the
+  same Kalshi reading pairing with Polymarket readings across SEVERAL
+  micro-batches (possible with an interval join) yields exactly one signal.
+
+  The batches are tiny by construction (a handful of matched events polled
+  every ~45s, 30s triggers), so rows are collected to the driver and written
+  in one INSERT ... executemany per batch. If the config ever grows to
+  thousands of events, switch to a staging-table + merge pattern.
 """
 
 import os
 
+import psycopg2
+import psycopg2.extras
 from pyspark.sql import DataFrame, SparkSession, Window
 from pyspark.sql import functions as F
 from pyspark.sql.types import DoubleType, StringType, StructField, StructType
@@ -35,9 +47,9 @@ from pyspark.sql.types import DoubleType, StringType, StructField, StructType
 # --- configuration (env-overridable) -----------------------------------------
 KAFKA_BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 KAFKA_TOPIC = os.environ.get("KAFKA_TOPIC", "market-prices")
-POSTGRES_URL = os.environ.get("POSTGRES_URL", "jdbc:postgresql://postgres:5432/markets")
-POSTGRES_USER = os.environ.get("POSTGRES_USER", "markets")
-POSTGRES_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "markets")
+POSTGRES_DSN = os.environ.get(
+    "POSTGRES_DSN", "postgresql://markets:markets@postgres:5432/markets"
+)
 CHECKPOINT_ROOT = os.environ.get("CHECKPOINT_ROOT", "/opt/checkpoints")
 
 # SIMPLIFICATION: the default 0.05 (5 percentage points) is a rough proxy for
@@ -57,13 +69,6 @@ JOIN_TOLERANCE_SECONDS = int(os.environ.get("JOIN_TOLERANCE_SECONDS", "90"))
 # state. Generous relative to the 45s poll interval.
 WATERMARK = os.environ.get("WATERMARK", "2 minutes")
 
-JDBC_OPTIONS = {
-    "url": POSTGRES_URL,
-    "user": POSTGRES_USER,
-    "password": POSTGRES_PASSWORD,
-    "driver": "org.postgresql.Driver",
-}
-
 # Schema of the JSON messages produced by producer/producer.py.
 READING_SCHEMA = StructType(
     [
@@ -75,6 +80,33 @@ READING_SCHEMA = StructType(
         StructField("timestamp", StringType(), nullable=False),  # ISO-8601 UTC
     ]
 )
+
+MARKET_PRICES_INSERT = """
+INSERT INTO market_prices
+    (venue, matched_event_id, contract_name, probability, raw_price, "timestamp")
+VALUES (%s, %s, %s, %s, %s, %s)
+ON CONFLICT (venue, matched_event_id, "timestamp") DO NOTHING
+"""
+
+SIGNALS_INSERT = """
+INSERT INTO mispricing_signals
+    (matched_event_id, kalshi_probability, polymarket_probability,
+     delta, "timestamp", kalshi_ts, detected_at)
+VALUES (%s, %s, %s, %s, %s, %s, now())
+ON CONFLICT (matched_event_id, kalshi_ts) DO NOTHING
+"""
+
+
+def insert_rows(sql: str, rows: list[tuple]) -> None:
+    """Idempotent batch insert on the driver (see delivery-semantics note)."""
+    if not rows:
+        return
+    # Timestamps arrive as offset-less strings rendered in the Spark session
+    # timezone (UTC); the connection timezone is pinned to UTC so Postgres
+    # interprets them as the same instant.
+    with psycopg2.connect(POSTGRES_DSN, options="-c timezone=utc") as conn:
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_batch(cur, sql, rows)
 
 
 def build_readings_stream(spark: SparkSession) -> DataFrame:
@@ -101,17 +133,19 @@ def build_readings_stream(spark: SparkSession) -> DataFrame:
 # --- query 1: raw pass-through ------------------------------------------------
 
 def write_market_prices(batch_df: DataFrame, batch_id: int) -> None:
-    """foreachBatch sink: append every raw reading to Postgres market_prices."""
-    (
-        batch_df.select(
+    """foreachBatch sink: idempotent insert of every raw reading."""
+    rows = [
+        (r.venue, r.matched_event_id, r.contract_name,
+         r.probability, r.raw_price, r.timestamp)
+        for r in batch_df.select(
             "venue", "matched_event_id", "contract_name",
-            "probability", "raw_price", "timestamp",
-        )
-        .write.format("jdbc")
-        .options(dbtable="market_prices", **JDBC_OPTIONS)
-        .mode("append")
-        .save()
-    )
+            "probability", "raw_price",
+            # Cast to string in the session timezone (UTC): collect() would
+            # otherwise localize timestamps to the driver's OS timezone.
+            F.col("timestamp").cast("string").alias("timestamp"),
+        ).collect()
+    ]
+    insert_rows(MARKET_PRICES_INSERT, rows)
 
 
 # --- query 2: cross-venue join + mispricing signals ---------------------------
@@ -174,30 +208,40 @@ def build_signals_stream(readings: DataFrame) -> DataFrame:
     )
 
 
-def write_mispricing_signals(batch_df: DataFrame, batch_id: int) -> None:
-    """foreachBatch sink: dedupe pairs, then append signals to Postgres.
+def dedupe_signals_batch(batch_df: DataFrame) -> DataFrame:
+    """Keep only the closest-in-time pair per (event, Kalshi reading).
 
     The interval join can pair one Kalshi reading with 2-3 Polymarket readings
-    (adjacent poll cycles fall inside the tolerance window). Per micro-batch,
-    keep only the closest-in-time pair per (event, kalshi reading) so one
-    poll cycle emits at most one signal per event.
+    (adjacent poll cycles fall inside the tolerance window). Within a
+    micro-batch this window function picks the closest pair; ACROSS
+    micro-batches the ON CONFLICT (matched_event_id, kalshi_ts) key in the
+    sink guarantees at most one signal per Kalshi reading overall.
     """
     closest_pair = Window.partitionBy("matched_event_id", "kalshi_ts").orderBy(
         F.col("pair_gap_seconds").asc(), F.col("timestamp").asc()
     )
-    (
+    return (
         batch_df.withColumn("rank", F.row_number().over(closest_pair))
         .filter(F.col("rank") == 1)
-        .withColumn("detected_at", F.current_timestamp())
         .select(
             "matched_event_id", "kalshi_probability", "polymarket_probability",
-            "delta", "timestamp", "detected_at",
+            "delta",
+            # String casts render in session timezone (UTC); see
+            # write_market_prices for why collect() of raw timestamps is unsafe.
+            F.col("timestamp").cast("string").alias("timestamp"),
+            F.col("kalshi_ts").cast("string").alias("kalshi_ts"),
         )
-        .write.format("jdbc")
-        .options(dbtable="mispricing_signals", **JDBC_OPTIONS)
-        .mode("append")
-        .save()
     )
+
+
+def write_mispricing_signals(batch_df: DataFrame, batch_id: int) -> None:
+    """foreachBatch sink: dedupe pairs, then idempotently insert signals."""
+    rows = [
+        (r.matched_event_id, r.kalshi_probability, r.polymarket_probability,
+         r.delta, r.timestamp, r.kalshi_ts)
+        for r in dedupe_signals_batch(batch_df).collect()
+    ]
+    insert_rows(SIGNALS_INSERT, rows)
 
 
 def main() -> None:
@@ -205,6 +249,8 @@ def main() -> None:
         SparkSession.builder.appName("mispricing-detector")
         # Local single-process job: cut the default 200 shuffle partitions.
         .config("spark.sql.shuffle.partitions", "4")
+        # Collected timestamps must be unambiguous UTC (see insert_rows).
+        .config("spark.sql.session.timeZone", "UTC")
         .getOrCreate()
     )
     spark.sparkContext.setLogLevel("WARN")

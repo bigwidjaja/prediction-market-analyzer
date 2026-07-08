@@ -61,6 +61,8 @@ from datetime import datetime, timezone
 import requests
 import yaml
 from confluent_kafka import Producer
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("producer")
@@ -191,12 +193,30 @@ def poll_once(session: requests.Session, producer: Producer, events: list[dict])
                 failed += 1
                 continue
             message = reading.to_message()
-            producer.produce(
-                TOPIC,
-                key=event_id.encode(),
-                value=json.dumps(message).encode(),
-                callback=delivery_callback,
-            )
+            try:
+                producer.produce(
+                    TOPIC,
+                    key=event_id.encode(),
+                    value=json.dumps(message).encode(),
+                    callback=delivery_callback,
+                )
+            except BufferError:
+                # Local librdkafka queue is full (broker unreachable for a
+                # while). Give delivery callbacks a chance to drain it and
+                # retry once; if still full, drop this reading rather than
+                # crash the whole poll loop.
+                producer.poll(5)
+                try:
+                    producer.produce(
+                        TOPIC,
+                        key=event_id.encode(),
+                        value=json.dumps(message).encode(),
+                        callback=delivery_callback,
+                    )
+                except BufferError:
+                    log.error("[%s/%s] Kafka queue full, dropping reading", venue, event_id)
+                    failed += 1
+                    continue
             log.info("[%s/%s] p(YES)=%.4f published", venue, event_id, reading.probability)
             ok += 1
     producer.flush(10)
@@ -216,6 +236,16 @@ def main() -> None:
     })
     session = requests.Session()
     session.headers["User-Agent"] = "mispricing-detector/0.1 (portfolio project)"
+    # Retry transient upstream failures (rate limits, 5xx, connection resets)
+    # with backoff inside one poll cycle instead of losing the reading.
+    retry = Retry(
+        total=3,
+        backoff_factor=1.0,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET",),
+    )
+    for prefix in ("https://", "http://"):
+        session.mount(prefix, HTTPAdapter(max_retries=retry))
 
     while True:
         started = time.monotonic()

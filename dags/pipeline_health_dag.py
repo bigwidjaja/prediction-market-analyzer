@@ -21,10 +21,13 @@ Uses the 'markets_db' Airflow connection (injected via the
 AIRFLOW_CONN_MARKETS_DB env var in docker-compose.yml).
 """
 
+import logging
 from datetime import datetime, timedelta
 
 from airflow.decorators import dag, task
 from airflow.providers.postgres.hooks.postgres import PostgresHook
+
+log = logging.getLogger(__name__)
 
 MARKETS_CONN_ID = "markets_db"
 
@@ -34,17 +37,17 @@ FRESHNESS_LOOKBACK_MINUTES = 15
 
 ROLLUP_SQL = """
 INSERT INTO daily_signal_summary
-    (summary_date, matched_event_id, max_delta, signal_count, reading_pairs, computed_at)
+    (summary_date, matched_event_id, max_delta, signal_count, reading_count, computed_at)
 SELECT
     d.summary_date,
     d.matched_event_id,
     s.max_delta,
     COALESCE(s.signal_count, 0),
-    d.reading_pairs,
+    d.reading_count,
     now()
 FROM (
-    -- readings observed per event per day (both venues)
-    SELECT "timestamp"::date AS summary_date, matched_event_id, count(*) AS reading_pairs
+    -- individual readings observed per event per day (both venues combined)
+    SELECT "timestamp"::date AS summary_date, matched_event_id, count(*) AS reading_count
     FROM market_prices
     WHERE "timestamp" >= (current_date - INTERVAL '1 day')
     GROUP BY 1, 2
@@ -59,19 +62,22 @@ LEFT JOIN (
 ON CONFLICT (summary_date, matched_event_id) DO UPDATE SET
     max_delta     = EXCLUDED.max_delta,
     signal_count  = EXCLUDED.signal_count,
-    reading_pairs = EXCLUDED.reading_pairs,
+    reading_count = EXCLUDED.reading_count,
     computed_at   = EXCLUDED.computed_at;
 """
 
 
 def _check_venue_freshness(venue: str) -> None:
     hook = PostgresHook(postgres_conn_id=MARKETS_CONN_ID)
+    # make_interval() takes the lookback as a plain integer parameter; relying
+    # on %s substitution inside an INTERVAL '...' string literal is a psycopg2
+    # implementation detail that breaks under other drivers.
     row = hook.get_first(
         """
         SELECT count(*), max("timestamp")
         FROM market_prices
         WHERE venue = %s
-          AND "timestamp" >= now() - INTERVAL '%s minutes'
+          AND "timestamp" >= now() - make_interval(mins => %s)
         """,
         parameters=(venue, FRESHNESS_LOOKBACK_MINUTES),
     )
@@ -84,8 +90,8 @@ def _check_venue_freshness(venue: str) -> None:
             f"{FRESHNESS_LOOKBACK_MINUTES} min (latest ever: {latest}). "
             f"Check the producer logs and whether the {venue} API is up."
         )
-    print(f"OK: {recent_count} '{venue}' readings in the last "
-          f"{FRESHNESS_LOOKBACK_MINUTES} min (latest: {latest}).")
+    log.info("OK: %s '%s' readings in the last %s min (latest: %s).",
+             recent_count, venue, FRESHNESS_LOOKBACK_MINUTES, latest)
 
 
 @dag(
@@ -111,11 +117,11 @@ def pipeline_health():
         hook = PostgresHook(postgres_conn_id=MARKETS_CONN_ID)
         hook.run(ROLLUP_SQL)
         for row in hook.get_records(
-            "SELECT summary_date, matched_event_id, max_delta, signal_count, reading_pairs "
+            "SELECT summary_date, matched_event_id, max_delta, signal_count, reading_count "
             "FROM daily_signal_summary WHERE summary_date >= current_date - 1 "
             "ORDER BY summary_date, matched_event_id"
         ):
-            print("rollup:", row)
+            log.info("rollup: %s", row)
 
     [check_kalshi_freshness(), check_polymarket_freshness()] >> rollup_daily_signal_summary()
 

@@ -69,10 +69,14 @@ services:
       kafka:
         condition: service_healthy
     entrypoint: ["/bin/sh", "-c"]
+    # 3-day retention: the Spark job starts from 'earliest' on a fresh
+    # checkpoint, so unbounded retention would make first startup replay the
+    # topic's entire history (all readings also live in Postgres anyway).
     command: >
       "/opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092
       --create --if-not-exists --topic market-prices
       --partitions 3 --replication-factor 1
+      --config retention.ms=259200000
       && echo 'topic market-prices ready'"
     restart: "no"
 
@@ -157,9 +161,7 @@ services:
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       KAFKA_TOPIC: market-prices
-      POSTGRES_URL: jdbc:postgresql://postgres:5432/markets
-      POSTGRES_USER: markets
-      POSTGRES_PASSWORD: markets
+      POSTGRES_DSN: postgresql://markets:markets@postgres:5432/markets
       CHECKPOINT_ROOT: /opt/checkpoints
       # Mispricing threshold in probability units (0.05 = 5 percentage
       # points). Rough proxy for "edge after estimated fees" — see job code.
@@ -177,13 +179,16 @@ services:
     <<: *airflow-common
     container_name: airflow-init
     entrypoint: /bin/bash
+    # NOTE: the parentheses matter — only the (idempotent) user-create step may
+    # fail silently on restarts. A failed 'db migrate' must fail the init
+    # container, otherwise webserver/scheduler start against an unmigrated DB.
     command:
       - -c
       - >
         airflow db migrate &&
-        airflow users create --username admin --password admin
+        (airflow users create --username admin --password admin
         --firstname Admin --lastname User --role Admin --email admin@example.com
-        || true
+        || true)
     restart: "no"
 
   airflow-webserver:
