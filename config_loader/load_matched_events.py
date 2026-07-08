@@ -31,22 +31,37 @@ ON CONFLICT (event_id) DO UPDATE SET
     loaded_at       = now();
 """
 
+REQUIRED_FIELDS = frozenset({"event_id", "kalshi_ticker", "polymarket_slug"})
+
+
+def validation_error(events: object) -> str | None:
+    """Return a human-readable problem with the parsed YAML, or None if valid."""
+    if not events:
+        return "no matched_events entries found"
+    if not isinstance(events, list):
+        return f"matched_events must be a list, got {type(events).__name__}"
+    seen_ids: set[str] = set()
+    for entry in events:
+        if not isinstance(entry, dict):
+            return f"entry {entry!r} is not a mapping"
+        missing = REQUIRED_FIELDS - set(entry)
+        if missing:
+            return f"entry {entry!r} is missing required fields: {sorted(missing)}"
+        if entry["event_id"] in seen_ids:
+            return f"duplicate event_id: {entry['event_id']!r}"
+        seen_ids.add(entry["event_id"])
+    return None
+
 
 def main() -> int:
     with open(CONFIG_PATH) as f:
         config = yaml.safe_load(f)
 
     events = config.get("matched_events") or []
-    if not events:
-        log.error("No matched_events found in %s", CONFIG_PATH)
+    error = validation_error(events)
+    if error is not None:
+        log.error("%s (in %s)", error, CONFIG_PATH)
         return 1
-
-    required = {"event_id", "kalshi_ticker", "polymarket_slug"}
-    for entry in events:
-        missing = required - set(entry)
-        if missing:
-            log.error("Entry %s is missing required fields: %s", entry, missing)
-            return 1
 
     with psycopg2.connect(POSTGRES_DSN) as conn, conn.cursor() as cur:
         for entry in events:

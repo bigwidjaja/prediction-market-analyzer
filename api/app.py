@@ -15,7 +15,7 @@ Endpoints (all JSON):
 """
 
 import os
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 
 import psycopg2
 import psycopg2.extras
@@ -35,26 +35,25 @@ FRESHNESS_MINUTES = int(os.environ.get("FRESHNESS_MINUTES", "15"))
 # the Spark job uses. Keep in sync with the spark service env in compose.
 MISPRICING_THRESHOLD = float(os.environ.get("MISPRICING_THRESHOLD", "0.05"))
 
-app = FastAPI(title="Mispricing Detector API", version="1.0.0")
+pool: psycopg2.pool.ThreadedConnectionPool | None = None
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    global pool
+    pool = psycopg2.pool.ThreadedConnectionPool(minconn=1, maxconn=8, dsn=POSTGRES_DSN)
+    try:
+        yield
+    finally:
+        pool.closeall()
+
+
+app = FastAPI(title="Mispricing Detector API", version="1.0.0", lifespan=lifespan)
 
 # The dashboard is same-origin behind nginx in compose; CORS is for local
 # `vite dev` (:5173) hitting the API (:8000) directly. Read-only data, no
 # credentials, so a wildcard is fine.
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"])
-
-pool: psycopg2.pool.ThreadedConnectionPool | None = None
-
-
-@app.on_event("startup")
-def open_pool() -> None:
-    global pool
-    pool = psycopg2.pool.ThreadedConnectionPool(minconn=1, maxconn=8, dsn=POSTGRES_DSN)
-
-
-@app.on_event("shutdown")
-def close_pool() -> None:
-    if pool is not None:
-        pool.closeall()
 
 
 @contextmanager

@@ -56,7 +56,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import requests
 import yaml
@@ -96,7 +96,7 @@ class Reading:
             "contract_name": self.contract_name,
             "probability": round(self.probability, 6),
             "raw_price": round(self.raw_price, 6),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
         }
 
 
@@ -134,7 +134,8 @@ def fetch_kalshi(session: requests.Session, event_id: str, ticker: str) -> Readi
         log.warning("[kalshi/%s] no usable price fields on %s, skipping", event_id, ticker)
         return None
 
-    return Reading("kalshi", event_id, ticker, probability, last if last is not None else probability)
+    raw_price = last if last is not None else probability
+    return Reading("kalshi", event_id, ticker, probability, raw_price)
 
 
 def fetch_polymarket(session: requests.Session, event_id: str, slug: str) -> Reading | None:
@@ -179,12 +180,12 @@ def poll_once(session: requests.Session, producer: Producer, events: list[dict])
     for event in events:
         event_id = event["event_id"]
         fetches = [
-            ("kalshi", lambda: fetch_kalshi(session, event_id, event["kalshi_ticker"])),
-            ("polymarket", lambda: fetch_polymarket(session, event_id, event["polymarket_slug"])),
+            ("kalshi", fetch_kalshi, event["kalshi_ticker"]),
+            ("polymarket", fetch_polymarket, event["polymarket_slug"]),
         ]
-        for venue, fetch in fetches:
+        for venue, fetch, contract in fetches:
             try:
-                reading = fetch()
+                reading = fetch(session, event_id, contract)
             except Exception as exc:  # per-(event,venue) isolation: log and move on
                 log.error("[%s/%s] fetch FAILED: %s", venue, event_id, exc)
                 failed += 1
