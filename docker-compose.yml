@@ -1,11 +1,10 @@
 # Cross-venue prediction market mispricing detector.
 # Everything runs locally; no cloud services, no API keys.
 #
-# Services (added in build-order steps):
-#   Step 1: kafka, kafka-init, postgres, config-loader
-#   Step 2: producer
-#   Step 3/4: spark
-#   Step 5: airflow-init, airflow-webserver, airflow-scheduler
+# Services:
+#   pipeline:  kafka, kafka-init, postgres, config-loader, producer, spark
+#   serving:   api (read-only FastAPI, :8000), web (React dashboard, :3000)
+#   ops:       airflow-init, airflow-webserver (:8080), airflow-scheduler
 #
 # Bring up:  docker compose up -d --build
 
@@ -168,6 +167,47 @@ services:
       MISPRICING_THRESHOLD: "0.05"
     volumes:
       - spark_checkpoints:/opt/checkpoints
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
+  # API — read-only FastAPI over the pipeline tables (events, prices, signals,
+  # rollups, freshness). The dashboard is its only in-repo consumer, but it is
+  # exposed on :8000 for anything else (curl, notebooks).
+  # --------------------------------------------------------------------------
+  api:
+    build: ./api
+    container_name: api
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_DSN: postgresql://markets:markets@postgres:5432/markets
+      FRESHNESS_MINUTES: 15
+      # Keep in sync with the spark service so the dashboard highlights
+      # deltas with the same threshold the detector uses.
+      MISPRICING_THRESHOLD: "0.05"
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
+  # Web — the React dashboard, built at image build time and served by nginx
+  # on :3000. nginx proxies /api to the api service (same-origin).
+  # --------------------------------------------------------------------------
+  web:
+    build: ./app
+    container_name: web
+    depends_on:
+      api:
+        condition: service_started
+    ports:
+      - "3000:80"
     restart: unless-stopped
 
   # --------------------------------------------------------------------------
