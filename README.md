@@ -1,19 +1,22 @@
 # Cross-Venue Prediction Market Mispricing Detector
 
-A real-time streaming pipeline that watches the **same real-world event** priced
-on two prediction market venues — [Kalshi](https://kalshi.com) and
-[Polymarket](https://polymarket.com) — and flags moments when their implied
-probabilities diverge by more than a configurable threshold.
+A real-time streaming tool that watches the **same real-world event** priced on
+two prediction market venues — [Kalshi](https://kalshi.com) and
+[Polymarket](https://polymarket.com) — flags moments when their implied
+probabilities diverge by more than a configurable threshold, and serves the
+results on a live web dashboard.
 
-Portfolio project demonstrating streaming data engineering: Kafka (KRaft),
-PySpark Structured Streaming (watermarked stream-stream join), Postgres, and
-Airflow — fully self-contained in Docker Compose. **No cloud services, no API
-keys** (both venues expose public market-data endpoints).
+Portfolio project demonstrating streaming data engineering end to end: Kafka
+(KRaft), PySpark Structured Streaming (watermarked stream-stream join),
+Postgres, Airflow, a FastAPI read layer, and a React dashboard — fully
+self-contained in Docker Compose. **No cloud services, no API keys** (both
+venues expose public market-data endpoints).
 
 > See [`PLANNING.md`](PLANNING.md) for the pre-implementation scrutiny pass:
 > what in the original design was verified against the live APIs, what had to
 > be corrected (endpoints, price field formats), and why each architecture
-> decision was made.
+> decision was made. [`NEXT_STEPS.md`](NEXT_STEPS.md) tracks planned follow-up
+> work.
 
 ## Architecture
 
@@ -35,22 +38,28 @@ keys** (both venues expose public market-data endpoints).
                               │   |Δ probability| > 0.05 ──► mispricing_    │
                               │                              signals        │
                               └──────────────────────┬──────────────────────┘
-                                                     │  foreachBatch + JDBC
+                                                     │  foreachBatch, idempotent
+                                                     │  ON CONFLICT inserts
                                                      ▼
                                                  Postgres ◄── matched_events
-                                                     ▲        (config loader)
-                                     Airflow (every 15 min)
-                                     ├─ per-venue freshness check
-                                     └─ daily_signal_summary rollup (upsert)
+                                                   ▲  ▲       (config loader)
+                                                   │  │
+                                   Airflow (15min) │  │ FastAPI (read-only, :8000)
+                                   ├─ freshness    │  │        ▲
+                                   └─ daily rollup ┘  │        │ /api proxied by nginx
+                                                      │        │
+                                                      └── React dashboard (:3000)
 ```
 
 | Component | File(s) | Role |
 |---|---|---|
 | Producer | `producer/producer.py` | Polls both venues per matched pair every 45s, publishes JSON readings to Kafka |
-| Spark job | `spark_jobs/mispricing_detector.py` | Pass-through to `market_prices` + watermarked interval join producing `mispricing_signals` |
-| Postgres | `postgres/init/*.sql` | Pipeline tables + indexes; separate `airflow` metadata DB |
-| Config loader | `config_loader/load_matched_events.py` | One-shot: UPSERTs `config/matched_events.yaml` into the `matched_events` table on every compose up |
+| Spark job | `spark_jobs/mispricing_detector.py` | Pass-through to `market_prices` + watermarked interval join producing `mispricing_signals` (idempotent sinks) |
+| Postgres | `postgres/init/*.sql` | Pipeline tables + indexes + dedup keys; separate `airflow` metadata DB |
+| Config loader | `config_loader/load_matched_events.py` | One-shot: validates and UPSERTs `config/matched_events.yaml` into the `matched_events` table on every compose up |
 | Airflow DAG | `dags/pipeline_health_dag.py` | Per-venue staleness alerts + idempotent daily rollup |
+| API | `api/app.py` | Read-only FastAPI over the pipeline tables: latest deltas, price history, signals, rollups, freshness |
+| Dashboard | `app/` | React + Tailwind UI (events, event detail with dual-venue chart, signals) served by nginx, live-polling the API |
 
 ## Event matching approach — and its limitations
 
@@ -89,7 +98,8 @@ change.** This project already absorbed two such drifts during implementation
   and must be double-parsed.
 
 The exact field mappings are documented in the docstring of
-`producer/producer.py`.
+`producer/producer.py` and pinned down by the unit tests in
+`tests/test_producer.py`.
 
 ## Setup
 
@@ -102,6 +112,10 @@ docker compose up -d --build
 
 First start pulls/builds images (a few minutes). Then:
 
+- **Dashboard**: <http://localhost:3000> — matched events with live deltas,
+  per-event price charts, signal history.
+- **API**: <http://localhost:8000/api/health> (interactive docs at
+  <http://localhost:8000/docs>).
 - **Airflow UI**: <http://localhost:8080> (user `admin`, password `admin`) —
   unpause the `pipeline_health` DAG.
 - **Kafka** debug listener on `localhost:9094`; **Postgres** on
@@ -112,7 +126,7 @@ data for a fully fresh start).
 
 ## Verifying each component
 
-The pipeline was built and verified in five steps; the same commands verify a
+The pipeline was built and verified in stages; the same commands verify a
 fresh deployment.
 
 ### 1. Kafka + Postgres + reference data
@@ -177,8 +191,11 @@ docker exec postgres psql -U markets -d markets \
 # rows with delta ≈ 0.97 (fake 0.99 vs real Kalshi ~0.015)
 ```
 
-(Alternatively set `MISPRICING_THRESHOLD: "0.001"` on the spark service and
-restart it — real readings will then trigger signals.)
+The signal also appears on the dashboard's Signals page and on the event's
+detail page.
+
+(Alternatively set `MISPRICING_THRESHOLD: "0.001"` on the spark **and api**
+services and restart them — real readings will then trigger signals.)
 
 ### 5. Airflow
 
@@ -194,18 +211,49 @@ docker exec postgres psql -U markets -d markets \
 
 To see the staleness alert fire: `docker stop producer`, wait >15 minutes, and
 the next `check_kalshi_freshness` / `check_polymarket_freshness` run fails with
-`STALE VENUE: ...` in the task log. `docker start producer` to recover.
+`STALE VENUE: ...` in the task log. `docker start producer` to recover. The
+dashboard sidebar shows the same freshness state (green/red per venue).
+
+### 6. API + dashboard
+
+```bash
+curl -s localhost:8000/api/health | python3 -m json.tool
+curl -s localhost:8000/api/events | python3 -m json.tool
+curl -s 'localhost:8000/api/events/fed-jul2026-no-change/prices?hours=1' | python3 -m json.tool
+# then open http://localhost:3000
+```
+
+## Tests and CI
+
+```bash
+pip install -r requirements-dev.txt
+ruff check .
+pytest                      # unit tests (producer parsing, config validation)
+
+# API integration tests need a Postgres:
+docker compose up -d postgres
+TEST_POSTGRES_DSN=postgresql://markets:markets@localhost:5432/markets pytest
+
+# frontend:
+cd app && npm ci && npm run lint && npm run build
+```
+
+GitHub Actions (`.github/workflows/ci.yml`) runs all of the above on every
+push/PR: ruff + pytest (with a Postgres service container) and the frontend
+lint + type-check + build.
 
 ## Design notes / known limitations
 
-- **At-least-once delivery.** Postgres writes are plain JDBC appends inside
-  `foreachBatch`; a Spark restart can replay the last micro-batch, duplicating
-  rows. Treat rows as observations, not unique events.
+- **Effectively-once delivery.** Sinks insert with `ON CONFLICT DO NOTHING`
+  against natural keys (`market_prices`: venue + event + timestamp;
+  `mispricing_signals`: event + Kalshi reading time), so micro-batch replays
+  after a Spark restart do not duplicate rows.
 - **Interval join, not "latest vs latest".** Readings are paired when their
   event times are within 90s of each other (2× the poll interval), with
   2-minute watermarks bounding join state. One Kalshi reading can match
-  several Polymarket readings; the sink dedupes per micro-batch, keeping the
-  closest-in-time pair per (event, Kalshi reading).
+  several Polymarket readings; the per-batch window dedup plus the
+  `(event, kalshi_ts)` unique key guarantee at most one signal per Kalshi
+  reading.
 - **The "daily" rollup runs every 15 minutes** and idempotently UPSERTs
   today's and yesterday's aggregates, converging to the final daily value
   after midnight UTC. Prefer a strict end-of-day job? Change the DAG
@@ -213,18 +261,24 @@ the next `check_kalshi_freshness` / `check_polymarket_freshness` run fails with
 - **Single-node everything.** One Kafka broker (RF 1), Spark in
   `local[2]` mode, one Postgres. Deliberate: this demonstrates streaming
   semantics, not cluster ops.
-- **No frontend/API layer** — strictly the pipeline, by design. Inspect via
-  SQL and the Airflow UI.
+- **The API is read-only and unauthenticated** — it exposes public market
+  data on localhost. Add auth before exposing it anywhere else.
 
 ## Repository layout
 
 ```
-├── docker-compose.yml          # all services (Kafka, Postgres, Spark, Airflow, producer)
+├── docker-compose.yml          # all services (Kafka, Postgres, Spark, Airflow, api, web, producer)
 ├── config/matched_events.yaml  # the curated cross-venue event mapping (v1 source of truth)
 ├── config_loader/              # one-shot YAML -> matched_events table sync
 ├── producer/                   # Kalshi/Polymarket poller -> Kafka
 ├── spark_jobs/                 # Structured Streaming job + Dockerfile (connector jars baked in)
 ├── postgres/init/              # schema + airflow metadata DB init scripts
 ├── dags/                       # Airflow pipeline_health DAG
-└── PLANNING.md                 # pre-implementation scrutiny & design decisions
+├── api/                        # read-only FastAPI over the pipeline tables
+├── app/                        # React dashboard (nginx-served; see app/README.md + DESIGN.md)
+├── tests/                      # pytest suite (producer parsing, config validation, API)
+├── .github/workflows/ci.yml    # lint + tests + frontend build on every push/PR
+├── DESIGN.md                   # dashboard design system
+├── PLANNING.md                 # pre-implementation scrutiny & design decisions
+└── NEXT_STEPS.md               # planned follow-up work
 ```
