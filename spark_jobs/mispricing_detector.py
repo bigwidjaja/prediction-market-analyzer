@@ -36,6 +36,10 @@ Delivery semantics — effectively-once:
   thousands of events, switch to a staging-table + merge pattern.
 """
 
+# The apache/spark:3.5.3 image ships Python 3.8, which cannot evaluate
+# builtin-generic annotations like list[tuple] at runtime without this.
+from __future__ import annotations
+
 import os
 
 import psycopg2
