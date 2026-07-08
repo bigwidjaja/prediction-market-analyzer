@@ -4,6 +4,7 @@ COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
 WORKDIR /app
-COPY load_matched_events.py .
+COPY app.py .
 
-CMD ["python", "load_matched_events.py"]
+EXPOSE 8000
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]

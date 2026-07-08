@@ -1,0 +1,10 @@
+# Tooling for running lint + unit tests locally and in CI.
+# (Service containers pin their own runtime deps in their Dockerfiles.)
+pytest==8.3.4
+ruff==0.8.6
+requests==2.32.3
+PyYAML==6.0.2
+confluent-kafka==2.6.1
+psycopg2-binary==2.9.10
+fastapi==0.115.6
+httpx==0.28.1
